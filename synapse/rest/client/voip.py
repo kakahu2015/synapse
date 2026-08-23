@@ -26,8 +26,6 @@ import logging
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from twisted.internet.defer import DeferredLock
-
 from synapse.http.client import SimpleHttpClient
 from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet
@@ -40,10 +38,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-# Keep a small safety margin so that cached credentials are not handed out
-# right at the end of their lifetime.
-TURN_BROKER_CACHE_SAFETY_SECONDS = 60
 
 
 def _get_turn_uri_port(uri: str) -> int | None:
@@ -166,9 +160,6 @@ class VoipRestServlet(RestServlet):
         self.hs = hs
         self.auth = hs.get_auth()
         self.http_client: SimpleHttpClient = hs.get_proxied_http_client()
-        self._turn_broker_cache: JsonDict | None = None
-        self._turn_broker_cache_expires_at_ms = 0
-        self._turn_broker_cache_lock = DeferredLock()
 
     async def _get_turn_broker_credentials(self, ttl: int) -> JsonDict | None:
         """Fetch TURN credentials from a federated TURN broker.
@@ -191,49 +182,16 @@ class VoipRestServlet(RestServlet):
         if api_token:
             headers = {b"Authorization": [f"Bearer {api_token}".encode("ascii")]}
 
-        now_ms = self.hs.get_clock().time_msec()
-        if (
-            self._turn_broker_cache is not None
-            and now_ms < self._turn_broker_cache_expires_at_ms
-        ):
-            return self._turn_broker_cache.copy()
+        response = await self.http_client.post_json_get_json(
+            broker_url,
+            {"ttl": ttl},
+            headers=headers,
+        )
 
-        # Re-check after acquiring the lock so concurrent clients share one
-        # broker request instead of creating a cache stampede.
-        await self._turn_broker_cache_lock.acquire()
-        try:
-            now_ms = self.hs.get_clock().time_msec()
-            if (
-                self._turn_broker_cache is not None
-                and now_ms < self._turn_broker_cache_expires_at_ms
-            ):
-                return self._turn_broker_cache.copy()
+        if not isinstance(response, dict):
+            raise ValueError("TURN broker returned a non-object response")
 
-            response = await self.http_client.post_json_get_json(
-                broker_url,
-                {"ttl": ttl},
-                headers=headers,
-            )
-
-            if not isinstance(response, dict):
-                raise ValueError("TURN broker returned a non-object response")
-
-            credentials = _validate_turn_credentials_response(response, ttl)
-            cache_ttl = max(
-                credentials["ttl"] - TURN_BROKER_CACHE_SAFETY_SECONDS, 0
-            )
-            if cache_ttl > 0:
-                self._turn_broker_cache = credentials
-                self._turn_broker_cache_expires_at_ms = (
-                    self.hs.get_clock().time_msec() + cache_ttl * 1000
-                )
-            else:
-                self._turn_broker_cache = None
-                self._turn_broker_cache_expires_at_ms = 0
-
-            return credentials.copy()
-        finally:
-            self._turn_broker_cache_lock.release()
+        return _validate_turn_credentials_response(response, ttl)
 
     async def _get_cloudflare_turn_credentials(self, ttl: int) -> JsonDict | None:
         """Fetch short-lived TURN credentials from Cloudflare's TURN API.
